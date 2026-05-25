@@ -225,7 +225,71 @@ def fetch_transcript(video_id: str, languages: list[str]) -> list[TranscriptLine
     return lines
 
 
+def transcript_error_message(exc: Exception) -> str:
+    raw = str(exc)
+    if "blocking requests from your IP" in raw or "cloud provider" in raw:
+        return (
+            "YouTube blocked transcript requests from this hosted app. "
+            "Paste or upload the transcript below and summarize again."
+        )
+    if "disabled" in raw.lower():
+        return "This video has transcripts disabled. Paste or upload a transcript to summarize it."
+    if "no transcript" in raw.lower():
+        return "No public transcript was found for this video. Paste or upload a transcript to summarize it."
+    return "I could not fetch captions for this video. Paste or upload a transcript to summarize it."
+
+
+def parse_timestamp(value: str) -> float | None:
+    match = re.search(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:[,.](\d{1,3}))?", value)
+    if not match:
+        return None
+
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    milliseconds = int((match.group(4) or "0").ljust(3, "0"))
+    return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+
+
+def timestamped_transcript_to_lines(text: str) -> list[TranscriptLine]:
+    lines: list[TranscriptLine] = []
+    pending_start: float | None = None
+    pending_text: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.isdigit() or line.upper() == "WEBVTT":
+            continue
+
+        if "-->" in line:
+            if pending_start is not None and pending_text:
+                lines.append(TranscriptLine(pending_start, 8.0, clean_text(" ".join(pending_text))))
+            pending_start = parse_timestamp(line.split("-->", 1)[0])
+            pending_text = []
+            continue
+
+        inline_timestamp = re.match(r"^\[?(\d{1,2}:\d{2}(?::\d{2})?)\]?\s+(.+)$", line)
+        if inline_timestamp:
+            if pending_start is not None and pending_text:
+                lines.append(TranscriptLine(pending_start, 8.0, clean_text(" ".join(pending_text))))
+            pending_start = parse_timestamp(inline_timestamp.group(1))
+            pending_text = [inline_timestamp.group(2)]
+            continue
+
+        if pending_start is not None:
+            pending_text.append(line)
+
+    if pending_start is not None and pending_text:
+        lines.append(TranscriptLine(pending_start, 8.0, clean_text(" ".join(pending_text))))
+
+    return [line for line in lines if line.text]
+
+
 def manual_transcript_to_lines(text: str) -> list[TranscriptLine]:
+    timestamped_lines = timestamped_transcript_to_lines(text)
+    if timestamped_lines:
+        return timestamped_lines
+
     paragraphs = [clean_text(part) for part in re.split(r"\n+", text) if clean_text(part)]
     if not paragraphs:
         return []
@@ -427,8 +491,9 @@ def app() -> None:
         key_point_count = st.slider("Key points", min_value=5, max_value=20, value=10)
         chapter_minutes = st.slider("Chapter length", min_value=1, max_value=10, value=3)
         st.divider()
+        uploaded_transcript = st.file_uploader("Upload transcript", type=["txt", "srt", "vtt"])
         manual_text = st.text_area(
-            "Manual transcript fallback",
+            "Paste transcript",
             height=180,
             placeholder="Paste transcript here if YouTube captions are unavailable.",
         )
@@ -438,8 +503,13 @@ def app() -> None:
         st.info("Enter a YouTube URL and click Summarize.")
         return
 
+    uploaded_text = ""
+    if uploaded_transcript is not None:
+        uploaded_text = uploaded_transcript.getvalue().decode("utf-8", errors="ignore")
+    fallback_text = manual_text.strip() or uploaded_text.strip()
+
     video_id = extract_video_id(video_url)
-    if not video_id and not manual_text.strip():
+    if not video_id and not fallback_text:
         st.error("Please enter a valid YouTube URL, video ID, or paste a manual transcript.")
         return
 
@@ -451,19 +521,15 @@ def app() -> None:
         try:
             transcript_lines = fetch_transcript(video_id, languages)
         except Exception as exc:
-            if manual_text.strip():
-                transcript_lines = manual_transcript_to_lines(manual_text)
+            if fallback_text:
+                transcript_lines = manual_transcript_to_lines(fallback_text)
                 transcript_source = "manual transcript"
-                st.warning(f"Could not fetch YouTube transcript, so I used your pasted text. Details: {exc}")
+                st.warning("Could not fetch YouTube captions, so I used the transcript you provided.")
             else:
-                st.error(
-                    "I could not fetch a public transcript for this video. "
-                    "Paste a transcript in the sidebar and run it again."
-                )
-                st.caption(str(exc))
+                st.error(transcript_error_message(exc))
                 return
-    elif manual_text.strip():
-        transcript_lines = manual_transcript_to_lines(manual_text)
+    elif fallback_text:
+        transcript_lines = manual_transcript_to_lines(fallback_text)
         transcript_source = "manual transcript"
 
     full_text = lines_to_text(transcript_lines)
